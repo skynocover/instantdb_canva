@@ -4,16 +4,16 @@ import { Button } from '@/components/ui/button';
 import { Eraser, Undo, Redo, Trash, Paintbrush } from 'lucide-react';
 import { init, tx, id } from '@instantdb/react';
 
-// 定义 DrawingAction 类型
+type Point = { x: number; y: number };
+
 type DrawingAction = {
   id: string;
   type: 'draw' | 'clear' | 'erase';
-  points: { x: number; y: number }[];
+  paths: Point[][];
   color?: string;
   thickness?: number;
 };
 
-// 初始化 InstantDB
 const db = init<DrawingAction>({ appId: import.meta.env.VITE_INSTANTDB_APP_ID });
 
 const CollaborativeDrawingBoard = () => {
@@ -22,10 +22,10 @@ const CollaborativeDrawingBoard = () => {
   const [color, setColor] = useState('#000000');
   const [thickness, setThickness] = useState(5);
   const [isEraser, setIsEraser] = useState(false);
-  const [currentStep, setCurrentStep] = useState(0);
   const [localActions, setLocalActions] = useState<DrawingAction[]>([]);
+  const [undoneActions, setUndoneActions] = useState<DrawingAction[]>([]);
+  const currentPathRef = useRef<Point[]>([]);
 
-  // 查询所有绘画动作
   const { data } = db.useQuery({ drawingActions: {} });
   const drawingActions = data?.drawingActions || [];
 
@@ -47,15 +47,19 @@ const CollaborativeDrawingBoard = () => {
       context.clearRect(0, 0, canvas!.width, canvas!.height);
 
       actions.forEach((action: DrawingAction) => {
-        if (action.points && (action.type === 'draw' || action.type === 'erase')) {
-          context.beginPath();
-          context.moveTo(action.points[0].x, action.points[0].y);
-          action.points.forEach((point) => {
-            context.lineTo(point.x, point.y);
+        if (action.paths && (action.type === 'draw' || action.type === 'erase')) {
+          action.paths.forEach((path) => {
+            if (path.length > 0) {
+              context.beginPath();
+              context.moveTo(path[0].x, path[0].y);
+              path.forEach((point) => {
+                context.lineTo(point.x, point.y);
+              });
+              context.strokeStyle = action.type === 'erase' ? '#FFFFFF' : action.color || color;
+              context.lineWidth = action.thickness || thickness;
+              context.stroke();
+            }
           });
-          context.strokeStyle = action.type === 'erase' ? '#FFFFFF' : action.color || color;
-          context.lineWidth = action.thickness || thickness;
-          context.stroke();
         } else if (action.type === 'clear') {
           context.clearRect(0, 0, canvas!.width, canvas!.height);
         }
@@ -65,35 +69,24 @@ const CollaborativeDrawingBoard = () => {
   );
 
   useEffect(() => {
-    // 当绘画动作发生变化时重新绘制画布
     setLocalActions(drawingActions);
-    setCurrentStep(drawingActions.length);
     redrawCanvas(drawingActions);
   }, [drawingActions, redrawCanvas]);
 
   const startDrawing = (event: React.MouseEvent<HTMLCanvasElement>) => {
     setIsDrawing(true);
     const { offsetX, offsetY } = event.nativeEvent;
-    const newAction: DrawingAction = {
-      id: id(),
-      type: isEraser ? 'erase' : 'draw',
-      points: [{ x: offsetX, y: offsetY }],
-      color: isEraser ? '#FFFFFF' : color,
-      thickness,
-    };
-    setLocalActions((prev) => [...prev, newAction]);
+    currentPathRef.current = [{ x: offsetX, y: offsetY }];
 
     const canvas = canvasRef.current;
     const context = canvas?.getContext('2d');
     if (context) {
       context.beginPath();
       context.moveTo(offsetX, offsetY);
-      context.lineTo(offsetX, offsetY);
       context.strokeStyle = isEraser ? '#FFFFFF' : color;
       context.lineWidth = thickness;
       context.lineCap = 'round';
       context.lineJoin = 'round';
-      context.stroke();
     }
   };
 
@@ -104,22 +97,13 @@ const CollaborativeDrawingBoard = () => {
     if (!canvas) return;
 
     const { offsetX, offsetY } = event.nativeEvent;
-
-    setLocalActions((prev) => {
-      const updatedActions = [...prev];
-      const currentAction = { ...updatedActions[updatedActions.length - 1] };
-      currentAction.points = [...currentAction.points, { x: offsetX, y: offsetY }];
-      updatedActions[updatedActions.length - 1] = currentAction;
-      return updatedActions;
-    });
+    currentPathRef.current.push({ x: offsetX, y: offsetY });
 
     const context = canvas.getContext('2d');
     if (context) {
       context.lineTo(offsetX, offsetY);
       context.strokeStyle = isEraser ? '#FFFFFF' : color;
       context.lineWidth = thickness;
-      context.lineCap = 'round';
-      context.lineJoin = 'round';
       context.stroke();
     }
   };
@@ -127,8 +111,19 @@ const CollaborativeDrawingBoard = () => {
   const stopDrawing = () => {
     if (isDrawing) {
       setIsDrawing(false);
-      const lastAction = localActions[localActions.length - 1];
-      db.transact(tx.drawingActions[lastAction.id].update(lastAction));
+      if (currentPathRef.current.length > 0) {
+        const newAction: DrawingAction = {
+          id: id(),
+          type: isEraser ? 'erase' : 'draw',
+          paths: [currentPathRef.current],
+          color: isEraser ? '#FFFFFF' : color,
+          thickness,
+        };
+        setLocalActions((prev) => [...prev, newAction]);
+        setUndoneActions([]); // Clear undone actions when a new action is added
+        db.transact(tx.drawingActions[newAction.id].update(newAction));
+      }
+      currentPathRef.current = [];
     }
   };
 
@@ -136,9 +131,12 @@ const CollaborativeDrawingBoard = () => {
     const clearAction: DrawingAction = {
       id: id(),
       type: 'clear',
-      points: [],
+      paths: [],
     };
+    setLocalActions((prev) => [...prev, clearAction]);
+    setUndoneActions([]);
     db.transact(tx.drawingActions[clearAction.id].update(clearAction));
+    redrawCanvas([clearAction]);
   };
 
   const toggleEraser = () => {
@@ -146,16 +144,22 @@ const CollaborativeDrawingBoard = () => {
   };
 
   const undo = () => {
-    if (currentStep > 0) {
-      setCurrentStep((prev) => prev - 1);
-      redrawCanvas(localActions.slice(0, currentStep - 1));
+    if (localActions.length > 0) {
+      const lastAction = localActions[localActions.length - 1];
+      setLocalActions((prev) => prev.slice(0, -1));
+      setUndoneActions((prev) => [...prev, lastAction]);
+      redrawCanvas(localActions.slice(0, -1));
+      db.transact(tx.drawingActions[lastAction.id].delete());
     }
   };
 
   const redo = () => {
-    if (currentStep < localActions.length) {
-      setCurrentStep((prev) => prev + 1);
-      redrawCanvas(localActions.slice(0, currentStep + 1));
+    if (undoneActions.length > 0) {
+      const actionToRedo = undoneActions[undoneActions.length - 1];
+      setUndoneActions((prev) => prev.slice(0, -1));
+      setLocalActions((prev) => [...prev, actionToRedo]);
+      redrawCanvas([...localActions, actionToRedo]);
+      db.transact(tx.drawingActions[actionToRedo.id].update(actionToRedo));
     }
   };
 
@@ -193,10 +197,10 @@ const CollaborativeDrawingBoard = () => {
         <Button onClick={toggleEraser} variant={isEraser ? 'secondary' : 'outline'} size="icon">
           {isEraser ? <Paintbrush className="h-4 w-4" /> : <Eraser className="h-4 w-4" />}
         </Button>
-        <Button onClick={undo} disabled={currentStep === 0} size="icon">
+        <Button onClick={undo} disabled={localActions.length === 0} size="icon">
           <Undo className="h-4 w-4" />
         </Button>
-        <Button onClick={redo} disabled={currentStep === localActions.length} size="icon">
+        <Button onClick={redo} disabled={undoneActions.length === 0} size="icon">
           <Redo className="h-4 w-4" />
         </Button>
         <Button onClick={clearCanvas} variant="destructive" size="icon">
