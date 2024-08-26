@@ -27,7 +27,7 @@ const CollaborativeDrawingBoard = () => {
   const currentPathRef = useRef<Point[]>([]);
 
   const { data } = db.useQuery({ drawingActions: {} });
-  const drawingActions = data?.drawingActions || [];
+  const drawingActions: any = data?.drawingActions || [];
 
   useEffect(() => {
     const canvas = canvasRef.current;
